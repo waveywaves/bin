@@ -1,0 +1,251 @@
+#!/bin/bash
+set -e
+
+# Define variables
+CLUSTER_NAME="kind"
+REG_PORT='5001'
+REG_NAME='kind-registry'
+KUBECONFIG="$HOME/.kube/config"
+
+function start_registry() {
+  running="$(docker inspect -f '{{.State.Running}}' ${REG_NAME} 2>/dev/null || echo false)"
+
+  if [[ ${running} != "true" ]]; then
+    docker rm -f kind-registry || true
+    docker run \
+      -d --restart=always -p "127.0.0.1:${REG_PORT}:5000" \
+      -e REGISTRY_HTTP_SECRET=secret \
+      --name "${REG_NAME}" \
+      registry:2
+  fi
+}
+
+# Function to check Tekton dashboard ingress status
+check_tekton_ingress() {
+    echo "🔍 Checking if Tekton dashboard ingress is working properly..."
+    
+    # Check if the ingress exists
+    echo "📋 Ingress resource status:"
+    kubectl get ingress -n tekton-pipelines
+    
+    # Check if the service exists and is properly configured
+    echo "📋 Tekton dashboard service status:"
+    kubectl get svc -n tekton-pipelines tekton-dashboard
+    
+    # Check if ingress controller pods are running
+    echo "📋 Ingress controller pod status:"
+    kubectl get pods -n ingress-nginx
+    
+    # Check for ingress controller logs that might indicate issues
+    echo "📋 Recent ingress controller logs:"
+    kubectl logs -n ingress-nginx -l app.kubernetes.io/component=controller --tail=20
+    
+    # Detailed ingress status
+    echo "📋 Detailed ingress configuration:"
+    kubectl describe ingress -n tekton-pipelines tekton-dashboard-ingress
+    
+    # Add more detailed service and ingress checks
+    echo "📋 Detailed Tekton dashboard service information:"
+    kubectl describe svc -n tekton-pipelines tekton-dashboard
+    
+    echo "📋 Detailed registry service information:"
+    kubectl describe svc -n registry registry
+    
+    echo "📋 Checking endpoints for Tekton dashboard:"
+    kubectl get endpoints -n tekton-pipelines tekton-dashboard
+    
+    echo "📋 Checking endpoints for registry:"
+    kubectl get endpoints -n registry registry
+    
+    echo "📋 Checking if ingress controller is properly configured:"
+    kubectl get configmap -n ingress-nginx ingress-nginx-controller -o yaml
+    
+    # Get IP and domain again to verify
+    NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
+    
+    if [ -z "$NODE_IP" ]; then
+        NODE_IP="127.0.0.1"
+    fi
+    
+    # Get MacBook IP address for external access
+    MAC_IP=$(ifconfig en0 | grep inet | grep -v inet6 | awk '{print $2}')
+    if [ -z "$MAC_IP" ]; then
+        echo "❌ Could not determine MacBook IP address. Using Node IP instead."
+        MAC_IP=$NODE_IP
+    else
+        echo "✅ Using MacBook IP address for external access: ${MAC_IP}"
+        NODE_IP=$MAC_IP
+    fi
+    
+    DOMAIN="tekton-dashboard.${NODE_IP}.sslip.io"
+    
+    # Test connectivity
+    echo "📡 Testing HTTP connectivity to ${DOMAIN}..."
+    curl -v http://${DOMAIN}
+    
+    echo "📡 Testing HTTP connectivity to registry..."
+    curl -v http://localhost:${REG_PORT}/v2/
+    
+    echo "✅ Diagnostic check complete. If all resources exist and are running, you should be able to access:"
+    echo "   - Tekton dashboard at http://${DOMAIN}"
+    echo "   - Docker registry at http://localhost:${REG_PORT}"
+}
+
+# Check if script is being sourced or run directly with a parameter
+if [[ "${BASH_SOURCE[0]}" != "${0}" ]] || [[ "$1" == "check" ]]; then
+    check_tekton_ingress
+    exit 0
+fi
+
+# Check if kind cluster already exists
+if kind get clusters | grep -q "${CLUSTER_NAME}"; then
+    echo "🗑️ Deleting existing kind cluster..."
+    kind delete cluster --name=${CLUSTER_NAME}
+fi
+
+# Start the registry before creating the cluster
+echo "🐳 Starting local registry container..."
+start_registry
+
+# Get MacBook IP address for Tekton dashboard domain
+MAC_IP=$(ifconfig en0 | grep inet | grep -v inet6 | awk '{print $2}')
+if [ -z "$MAC_IP" ]; then
+    echo "❌ Could not determine MacBook IP address. Using localhost instead."
+    MAC_IP="127.0.0.1"
+fi
+
+# Create sslip.io domain for Tekton dashboard only
+TEKTON_DOMAIN="tekton-dashboard.${MAC_IP}.sslip.io"
+REGISTRY_HOST="localhost:${REG_PORT}"
+
+echo "🌐 Using domains:"
+echo "   - Tekton Dashboard: ${TEKTON_DOMAIN}"
+echo "   - Docker Registry: ${REGISTRY_HOST} (local)"
+
+echo "🛠️ Creating Kind cluster with Ingress support..."
+kind create cluster --name=${CLUSTER_NAME} --config=- <<EOF
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+- role: control-plane
+  kubeadmConfigPatches:
+  - |
+    kind: InitConfiguration
+    nodeRegistration:
+      kubeletExtraArgs:
+        node-labels: "ingress-ready=true"
+  extraPortMappings:
+  - containerPort: 80
+    hostPort: 80
+    protocol: TCP
+  - containerPort: 443
+    hostPort: 443
+    protocol: TCP
+containerdConfigPatches:
+- |-
+  [plugins."io.containerd.grpc.v1.cri".registry.mirrors."localhost:${REG_PORT}"]
+    endpoint = ["http://${REG_NAME}:5000"]
+EOF
+
+# Set KUBECONFIG to the kind context
+echo "🔧 Setting up KUBECONFIG"
+kind --name ${CLUSTER_NAME} get kubeconfig > ${KUBECONFIG}
+
+echo "⏳ Waiting for Kind cluster to be ready..."
+kubectl wait --for=condition=Ready nodes --all --timeout=90s
+
+echo "📥 Installing NGINX Ingress Controller..."
+kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/kind/deploy.yaml
+
+echo "⏳ Waiting for Ingress controller to be ready..."
+kubectl wait --namespace ingress-nginx \
+  --for=condition=ready pod \
+  --selector=app.kubernetes.io/component=controller \
+  --timeout=120s
+
+# Connect the registry to the cluster network
+echo "🔌 Connecting registry to Kind network..."
+docker network connect "kind" "${REG_NAME}" || true
+
+# Document the local registry
+# https://github.com/kubernetes/enhancements/tree/master/keps/sig-cluster-lifecycle/generic/1755-communicating-a-local-registry
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: local-registry-hosting
+  namespace: kube-public
+data:
+  localRegistryHosting.v1: |
+    host: "localhost:${REG_PORT}"
+    help: "https://kind.sigs.k8s.io/docs/user/local-registry/"
+EOF
+
+echo "📥 Installing Tekton Pipelines..."
+kubectl apply --filename https://storage.googleapis.com/tekton-releases/pipeline/latest/release.yaml
+
+echo "📥 Installing Tekton Dashboard..."
+kubectl apply --filename https://storage.googleapis.com/tekton-releases/dashboard/latest/release.yaml
+
+echo "⏳ Waiting for Tekton to be available..."
+kubectl wait --for=condition=Available --timeout=180s deployment --all -n tekton-pipelines
+
+echo "🌐 Creating Ingress for Tekton Dashboard using sslip.io"
+cat <<EOF | kubectl apply -f -
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: tekton-dashboard-ingress
+  namespace: tekton-pipelines
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    nginx.ingress.kubernetes.io/ssl-redirect: "false"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "false"
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    nginx.ingress.kubernetes.io/backend-protocol: "HTTP"
+spec:
+  rules:
+  - host: ${TEKTON_DOMAIN}
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: tekton-dashboard
+            port:
+              number: 9097
+EOF
+
+echo "📡 Testing connectivity to Tekton Dashboard..."
+curl -v http://${TEKTON_DOMAIN}
+
+echo "📡 Testing connectivity to Docker Registry..."
+curl -v http://${REGISTRY_HOST}/v2/
+
+echo "🔎 Checking Tekton dashboard service..."
+kubectl get svc -n tekton-pipelines tekton-dashboard
+
+echo "🔎 Checking ingress controller status..."
+kubectl get pods -n ingress-nginx
+
+# Install Pipelines-as-Code
+echo "📥 Installing Pipelines-as-Code..."
+brew install openshift-pipelines/pipelines-as-code/tektoncd-pac || true
+
+echo "🚀 Bootstrapping Pipelines-as-Code..."
+tkn pac bootstrap
+
+# Set KO_DOCKER_REPO to point to local registry
+export KO_DOCKER_REPO="localhost:${REG_PORT}"
+# Set KO_INSECURE_REGISTRY to allow HTTP registry access
+export KO_INSECURE_REGISTRY=true
+
+echo "✅ Setup complete!"
+echo "🌐 Access points:"
+echo "   - Tekton Dashboard: http://${TEKTON_DOMAIN}"
+echo "   - Docker Registry: http://${REGISTRY_HOST}"
+echo "   - KO_DOCKER_REPO is set to: ${KO_DOCKER_REPO}"
+echo ""
