@@ -19,9 +19,9 @@ INTERACTIVE=true
 # Function to display help
 show_help() {
     cat << EOF
-Usage: pac-devknife [OPTIONS]
+Usage: devknife-pac [OPTIONS]
 
-PAC DevKnife - Bootstrap a Kind cluster with optional Tekton Pipelines-as-Code setup.
+DevKnife PAC - Bootstrap a Kind cluster with optional Tekton Pipelines-as-Code setup.
 
 OPTIONS:
     --cluster           Create a new Kind cluster (deletes existing if present)
@@ -37,10 +37,10 @@ OPTIONS:
 If no flags are provided, the script will prompt for each component interactively.
 
 Examples:
-    pac-devknife --cluster --registry --tekton    # Create cluster with registry and Tekton
-    pac-devknife --all                            # Create everything
-    pac-devknife --from-scratch --all             # Install prerequisites and create everything
-    pac-devknife check                           # Check existing setup
+    devknife-pac --cluster --registry --tekton    # Create cluster with registry and Tekton
+    devknife-pac --all                            # Create everything
+    devknife-pac --from-scratch --all             # Install prerequisites and create everything
+    devknife-pac check                           # Check existing setup
     
 EOF
 }
