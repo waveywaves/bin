@@ -1,0 +1,559 @@
+#!/bin/bash
+set -e
+
+# Define variables
+CLUSTER_NAME="kind"
+REG_PORT='5001'
+REG_NAME='kind-registry'
+KUBECONFIG="$HOME/.kube/config"
+
+# Initialize flags to false by default
+CREATE_CLUSTER=false
+CREATE_REGISTRY=false
+CREATE_INGRESS=false
+INSTALL_TEKTON=false
+INSTALL_PAC=false
+FROM_SCRATCH=false
+INTERACTIVE=true
+
+# Function to display help
+show_help() {
+    cat << EOF
+Usage: pac-devknife [OPTIONS]
+
+PAC DevKnife - Bootstrap a Kind cluster with optional Tekton Pipelines-as-Code setup.
+
+OPTIONS:
+    --cluster           Create a new Kind cluster (deletes existing if present)
+    --registry          Start a local Docker registry
+    --ingress           Install NGINX Ingress Controller
+    --tekton           Install Tekton Pipelines and Dashboard with ingress
+    --pac              Install and bootstrap Pipelines-as-Code
+    --from-scratch     Install prerequisites (kind, Docker, etc.) - assumes nothing is installed
+    --all              Enable all components (equivalent to --cluster --registry --ingress --tekton --pac)
+    --help, -h         Display this help message
+    check              Run diagnostic checks on existing setup
+
+If no flags are provided, the script will prompt for each component interactively.
+
+Examples:
+    pac-devknife --cluster --registry --tekton    # Create cluster with registry and Tekton
+    pac-devknife --all                            # Create everything
+    pac-devknife --from-scratch --all             # Install prerequisites and create everything
+    pac-devknife check                           # Check existing setup
+    
+EOF
+}
+
+# Function to ask user yes/no questions
+ask_user() {
+    local question="$1"
+    local default_answer="${2:-n}"
+    
+    if [[ "$default_answer" == "y" ]]; then
+        prompt="[Y/n]"
+    else
+        prompt="[y/N]"
+    fi
+    
+    while true; do
+        read -p "$question $prompt: " answer
+        answer=${answer:-$default_answer}
+        case $answer in
+            [Yy]* ) return 0;;
+            [Nn]* ) return 1;;
+            * ) echo "Please answer yes or no.";;
+        esac
+    done
+}
+
+# Parse command line arguments
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --cluster)
+                CREATE_CLUSTER=true
+                INTERACTIVE=false
+                shift
+                ;;
+            --registry)
+                CREATE_REGISTRY=true
+                INTERACTIVE=false
+                shift
+                ;;
+            --ingress)
+                CREATE_INGRESS=true
+                INTERACTIVE=false
+                shift
+                ;;
+            --tekton)
+                INSTALL_TEKTON=true
+                INTERACTIVE=false
+                shift
+                ;;
+            --pac)
+                INSTALL_PAC=true
+                INTERACTIVE=false
+                shift
+                ;;
+            --from-scratch)
+                FROM_SCRATCH=true
+                INTERACTIVE=false
+                shift
+                ;;
+            --all)
+                CREATE_CLUSTER=true
+                CREATE_REGISTRY=true
+                CREATE_INGRESS=true
+                INSTALL_TEKTON=true
+                INSTALL_PAC=true
+                INTERACTIVE=false
+                shift
+                ;;
+            --help|-h)
+                show_help
+                exit 0
+                ;;
+            check)
+                check_tekton_ingress
+                exit 0
+                ;;
+            *)
+                echo "Unknown option: $1"
+                show_help
+                exit 1
+                ;;
+        esac
+    done
+}
+
+# Function to install prerequisites from scratch
+install_prerequisites() {
+    echo "🔧 Installing prerequisites from scratch..."
+    
+    # Check if we're on macOS
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        # Check if Homebrew is installed
+        if ! command -v brew &> /dev/null; then
+            echo "📦 Installing Homebrew..."
+            /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+        fi
+        
+        # Install Docker Desktop if not installed
+        if ! command -v docker &> /dev/null; then
+            echo "🐳 Installing Docker Desktop..."
+            brew install --cask docker
+            echo "❗ Please start Docker Desktop manually and wait for it to be ready before continuing."
+            read -p "Press Enter when Docker Desktop is running..."
+        fi
+        
+        # Install kind if not installed
+        if ! command -v kind &> /dev/null; then
+            echo "🔧 Installing kind..."
+            brew install kind
+        fi
+        
+        # Install kubectl if not installed
+        if ! command -v kubectl &> /dev/null; then
+            echo "☸️ Installing kubectl..."
+            brew install kubectl
+        fi
+        
+        # Install tektoncd-cli if not installed
+        if ! command -v tkn &> /dev/null; then
+            echo "🔧 Installing Tekton CLI..."
+            brew install tektoncd-cli
+        fi
+        
+    else
+        echo "❌ --from-scratch currently only supports macOS. Please install prerequisites manually:"
+        echo "   - Docker"
+        echo "   - kind (https://kind.sigs.k8s.io/docs/user/quick-start/#installation)"
+        echo "   - kubectl"
+        echo "   - tektoncd-cli (optional)"
+        exit 1
+    fi
+    
+    echo "✅ Prerequisites installed successfully!"
+}
+
+# Function to prompt user for components
+prompt_for_components() {
+    echo "🤔 Let's configure your Kind cluster setup..."
+    echo ""
+    
+    if ask_user "Do you want to create a new Kind cluster?" "n"; then
+        CREATE_CLUSTER=true
+    fi
+    
+    if ask_user "Do you want to start a local Docker registry?" "n"; then
+        CREATE_REGISTRY=true
+    fi
+    
+    if ask_user "Do you want to install NGINX Ingress Controller?" "n"; then
+        CREATE_INGRESS=true
+    fi
+    
+    if ask_user "Do you want to install Tekton Pipelines and Dashboard?" "n"; then
+        INSTALL_TEKTON=true
+    fi
+    
+    if ask_user "Do you want to install and bootstrap Pipelines-as-Code?" "n"; then
+        INSTALL_PAC=true
+    fi
+    
+    echo ""
+}
+
+function start_registry() {
+  running="$(docker inspect -f '{{.State.Running}}' ${REG_NAME} 2>/dev/null || echo false)"
+
+  if [[ ${running} != "true" ]]; then
+    docker rm -f kind-registry || true
+    docker run \
+      -d --restart=always -p "127.0.0.1:${REG_PORT}:5000" \
+      -e REGISTRY_HTTP_SECRET=secret \
+      --name "${REG_NAME}" \
+      registry:2
+  fi
+}
+
+# Function to check Tekton dashboard ingress status
+check_tekton_ingress() {
+    echo "🔍 Checking if Tekton dashboard ingress is working properly..."
+    
+    # Check if the ingress exists
+    echo "📋 Ingress resource status:"
+    kubectl get ingress -n tekton-pipelines
+    
+    # Check if the service exists and is properly configured
+    echo "📋 Tekton dashboard service status:"
+    kubectl get svc -n tekton-pipelines tekton-dashboard
+    
+    # Check if ingress controller pods are running
+    echo "📋 Ingress controller pod status:"
+    kubectl get pods -n ingress-nginx
+    
+    # Check for ingress controller logs that might indicate issues
+    echo "📋 Recent ingress controller logs:"
+    kubectl logs -n ingress-nginx -l app.kubernetes.io/component=controller --tail=20
+    
+    # Detailed ingress status
+    echo "📋 Detailed ingress configuration:"
+    kubectl describe ingress -n tekton-pipelines tekton-dashboard-ingress
+    
+    # Add more detailed service and ingress checks
+    echo "📋 Detailed Tekton dashboard service information:"
+    kubectl describe svc -n tekton-pipelines tekton-dashboard
+    
+    echo "📋 Detailed registry service information:"
+    kubectl describe svc -n registry registry
+    
+    echo "📋 Checking endpoints for Tekton dashboard:"
+    kubectl get endpoints -n tekton-pipelines tekton-dashboard
+    
+    echo "📋 Checking endpoints for registry:"
+    kubectl get endpoints -n registry registry
+    
+    echo "📋 Checking if ingress controller is properly configured:"
+    kubectl get configmap -n ingress-nginx ingress-nginx-controller -o yaml
+    
+    # Get IP and domain again to verify
+    NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
+    
+    if [ -z "$NODE_IP" ]; then
+        NODE_IP="127.0.0.1"
+    fi
+    
+    # Get MacBook IP address for external access
+    MAC_IP=$(ifconfig en0 | grep inet | grep -v inet6 | awk '{print $2}')
+    if [ -z "$MAC_IP" ]; then
+        echo "❌ Could not determine MacBook IP address. Using Node IP instead."
+        MAC_IP=$NODE_IP
+    else
+        echo "✅ Using MacBook IP address for external access: ${MAC_IP}"
+        NODE_IP=$MAC_IP
+    fi
+    
+    DOMAIN="tekton-dashboard.${NODE_IP}.sslip.io"
+    
+    # Test connectivity
+    echo "📡 Testing HTTP connectivity to ${DOMAIN}..."
+    curl -v http://${DOMAIN}
+    
+    echo "📡 Testing HTTP connectivity to registry..."
+    curl -v http://localhost:${REG_PORT}/v2/
+    
+    echo "✅ Diagnostic check complete. If all resources exist and are running, you should be able to access:"
+    echo "   - Tekton dashboard at http://${DOMAIN}"
+    echo "   - Docker registry at http://localhost:${REG_PORT}"
+}
+
+# Parse command line arguments
+parse_args "$@"
+
+# Check if script is being sourced or run directly with the check parameter
+if [[ "${BASH_SOURCE[0]}" != "${0}" ]]; then
+    check_tekton_ingress
+    exit 0
+fi
+
+# Install prerequisites if requested
+if [[ "$FROM_SCRATCH" == true ]]; then
+    install_prerequisites
+fi
+
+# If no flags provided, prompt user interactively
+if [[ "$INTERACTIVE" == true ]]; then
+    prompt_for_components
+fi
+
+# Validate that if Tekton is requested, we also need ingress and cluster
+if [[ "$INSTALL_TEKTON" == true ]]; then
+    if [[ "$CREATE_CLUSTER" == false ]]; then
+        echo "⚠️  Tekton requires a cluster. Enabling cluster creation."
+        CREATE_CLUSTER=true
+    fi
+    if [[ "$CREATE_INGRESS" == false ]]; then
+        echo "⚠️  Tekton dashboard requires ingress. Enabling ingress installation."
+        CREATE_INGRESS=true
+    fi
+fi
+
+# Validate that if ingress is requested, we need a cluster
+if [[ "$CREATE_INGRESS" == true && "$CREATE_CLUSTER" == false ]]; then
+    echo "⚠️  Ingress requires a cluster. Enabling cluster creation."
+    CREATE_CLUSTER=true
+fi
+
+# Validate that if PAC is requested, we need Tekton
+if [[ "$INSTALL_PAC" == true && "$INSTALL_TEKTON" == false ]]; then
+    echo "⚠️  Pipelines-as-Code requires Tekton. Enabling Tekton installation."
+    INSTALL_TEKTON=true
+fi
+
+# Show what will be done
+echo "📋 Configuration summary:"
+echo "   - Create cluster: $CREATE_CLUSTER"
+echo "   - Start registry: $CREATE_REGISTRY"
+echo "   - Install ingress: $CREATE_INGRESS"
+echo "   - Install Tekton: $INSTALL_TEKTON"
+echo "   - Install PAC: $INSTALL_PAC"
+echo ""
+
+# Exit if nothing to do
+if [[ "$CREATE_CLUSTER" == false && "$CREATE_REGISTRY" == false && "$CREATE_INGRESS" == false && "$INSTALL_TEKTON" == false && "$INSTALL_PAC" == false ]]; then
+    echo "❌ Nothing to do. Use --help to see available options."
+    exit 0
+fi
+
+# Create cluster if requested
+if [[ "$CREATE_CLUSTER" == true ]]; then
+    # Check if kind cluster already exists
+    if kind get clusters | grep -q "${CLUSTER_NAME}"; then
+        echo "🗑️ Deleting existing kind cluster..."
+        kind delete cluster --name=${CLUSTER_NAME}
+    fi
+fi
+
+# Start the registry if requested
+if [[ "$CREATE_REGISTRY" == true ]]; then
+    echo "🐳 Starting local registry container..."
+    start_registry
+fi
+
+# Create cluster if requested
+if [[ "$CREATE_CLUSTER" == true ]]; then
+    # Get MacBook IP address for Tekton dashboard domain
+    MAC_IP=$(ifconfig en0 | grep inet | grep -v inet6 | awk '{print $2}')
+    if [ -z "$MAC_IP" ]; then
+        echo "❌ Could not determine MacBook IP address. Using localhost instead."
+        MAC_IP="127.0.0.1"
+    fi
+
+    # Create sslip.io domain for Tekton dashboard only
+    TEKTON_DOMAIN="tekton-dashboard.${MAC_IP}.sslip.io"
+    REGISTRY_HOST="localhost:${REG_PORT}"
+
+    echo "🌐 Using domains:"
+    echo "   - Tekton Dashboard: ${TEKTON_DOMAIN}"
+    echo "   - Docker Registry: ${REGISTRY_HOST} (local)"
+
+    echo "🛠️ Creating Kind cluster with Ingress support..."
+    kind create cluster --name=${CLUSTER_NAME} --config=- <<EOF
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+- role: control-plane
+  kubeadmConfigPatches:
+  - |
+    kind: InitConfiguration
+    nodeRegistration:
+      kubeletExtraArgs:
+        node-labels: "ingress-ready=true"
+  extraPortMappings:
+  - containerPort: 80
+    hostPort: 80
+    protocol: TCP
+  - containerPort: 443
+    hostPort: 443
+    protocol: TCP
+containerdConfigPatches:
+- |-
+  [plugins."io.containerd.grpc.v1.cri".registry.mirrors."localhost:${REG_PORT}"]
+    endpoint = ["http://${REG_NAME}:5000"]
+EOF
+
+    # Set KUBECONFIG to the kind context
+    echo "🔧 Setting up KUBECONFIG"
+    kind --name ${CLUSTER_NAME} get kubeconfig > ${KUBECONFIG}
+
+    echo "⏳ Waiting for Kind cluster to be ready..."
+    kubectl wait --for=condition=Ready nodes --all --timeout=90s
+    
+    # Connect the registry to the cluster network if registry was created
+    if [[ "$CREATE_REGISTRY" == true ]]; then
+        echo "🔌 Connecting registry to Kind network..."
+        docker network connect "kind" "${REG_NAME}" || true
+
+        # Document the local registry
+        # https://github.com/kubernetes/enhancements/tree/master/keps/sig-cluster-lifecycle/generic/1755-communicating-a-local-registry
+        cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: local-registry-hosting
+  namespace: kube-public
+data:
+  localRegistryHosting.v1: |
+    host: "localhost:${REG_PORT}"
+    help: "https://kind.sigs.k8s.io/docs/user/local-registry/"
+EOF
+    fi
+fi
+
+# Install NGINX Ingress Controller if requested
+if [[ "$CREATE_INGRESS" == true ]]; then
+    echo "📥 Installing NGINX Ingress Controller..."
+    kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/kind/deploy.yaml
+
+    echo "⏳ Waiting for Ingress controller to be ready..."
+    kubectl wait --namespace ingress-nginx \
+      --for=condition=ready pod \
+      --selector=app.kubernetes.io/component=controller \
+      --timeout=120s
+fi
+
+# Install Tekton if requested
+if [[ "$INSTALL_TEKTON" == true ]]; then
+    echo "📥 Installing Tekton Pipelines..."
+    kubectl apply --filename https://storage.googleapis.com/tekton-releases/pipeline/latest/release.yaml
+
+    echo "📥 Installing Tekton Dashboard..."
+    kubectl apply --filename https://storage.googleapis.com/tekton-releases/dashboard/latest/release.yaml
+
+    echo "⏳ Waiting for Tekton to be available..."
+    kubectl wait --for=condition=Available --timeout=180s deployment --all -n tekton-pipelines
+
+    # Ensure variables are set for Tekton domain
+    if [[ -z "$TEKTON_DOMAIN" ]]; then
+        MAC_IP=$(ifconfig en0 | grep inet | grep -v inet6 | awk '{print $2}')
+        if [ -z "$MAC_IP" ]; then
+            MAC_IP="127.0.0.1"
+        fi
+        TEKTON_DOMAIN="tekton-dashboard.${MAC_IP}.sslip.io"
+    fi
+
+    echo "🌐 Creating Ingress for Tekton Dashboard using sslip.io"
+    cat <<EOF | kubectl apply -f -
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: tekton-dashboard-ingress
+  namespace: tekton-pipelines
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    nginx.ingress.kubernetes.io/ssl-redirect: "false"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "false"
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    nginx.ingress.kubernetes.io/backend-protocol: "HTTP"
+spec:
+  rules:
+  - host: ${TEKTON_DOMAIN}
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: tekton-dashboard
+            port:
+              number: 9097
+EOF
+
+    echo "📡 Testing connectivity to Tekton Dashboard..."
+    curl -v http://${TEKTON_DOMAIN}
+
+    echo "🔎 Checking Tekton dashboard service..."
+    kubectl get svc -n tekton-pipelines tekton-dashboard
+
+    echo "🔎 Checking ingress controller status..."
+    kubectl get pods -n ingress-nginx
+fi
+
+# Test registry connectivity if registry was created
+if [[ "$CREATE_REGISTRY" == true ]]; then
+    REGISTRY_HOST="localhost:${REG_PORT}"
+    echo "📡 Testing connectivity to Docker Registry..."
+    curl -v http://${REGISTRY_HOST}/v2/
+fi
+
+# Install Pipelines-as-Code if requested
+if [[ "$INSTALL_PAC" == true ]]; then
+    echo "📥 Installing Pipelines-as-Code..."
+    brew install openshift-pipelines/pipelines-as-code/tektoncd-pac || true
+
+    echo "🚀 Bootstrapping Pipelines-as-Code..."
+    tkn pac bootstrap
+fi
+
+# Set environment variables if registry was created
+if [[ "$CREATE_REGISTRY" == true ]]; then
+    export KO_DOCKER_REPO="localhost:${REG_PORT}"
+    export KO_INSECURE_REGISTRY=true
+fi
+
+echo "✅ Setup complete!"
+echo "🌐 Access points:"
+
+# Show access points based on what was installed
+if [[ "$INSTALL_TEKTON" == true ]] && [[ -n "$TEKTON_DOMAIN" ]]; then
+    echo "   - Tekton Dashboard: http://${TEKTON_DOMAIN}"
+fi
+
+if [[ "$CREATE_REGISTRY" == true ]]; then
+    REGISTRY_HOST="localhost:${REG_PORT}"
+    echo "   - Docker Registry: http://${REGISTRY_HOST}"
+    echo "   - KO_DOCKER_REPO is set to: ${KO_DOCKER_REPO}"
+fi
+
+if [[ "$CREATE_CLUSTER" == true ]]; then
+    echo "   - Kubectl context: kind-${CLUSTER_NAME}"
+fi
+
+echo ""
+
+# Show next steps based on what was installed
+echo "🚀 Next steps:"
+if [[ "$CREATE_CLUSTER" == true ]]; then
+    echo "   - Verify cluster: kubectl cluster-info --context kind-${CLUSTER_NAME}"
+fi
+if [[ "$INSTALL_TEKTON" == true ]]; then
+    echo "   - Check Tekton: kubectl get pods -n tekton-pipelines"
+fi
+if [[ "$INSTALL_PAC" == true ]]; then
+    echo "   - Configure PAC: tkn pac --help"
+fi
+echo ""

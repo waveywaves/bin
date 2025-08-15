@@ -1,1 +1,4 @@
+#!/bin/bash
+set -e
+
 watch -n1 'kubectl get pipelineruns -o custom-columns="NAME:.metadata.name,SHA:.metadata.annotations.pipelinesascode\.tekton\.dev/sha" | grep -v "<none>"'
